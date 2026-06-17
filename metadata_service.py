@@ -145,6 +145,9 @@ class MetadataService:
 
     def delete(self, path: str) -> Tuple[bool, str]:
         with self._lock:
+            if path == "/" or path == "":
+                return False, "Cannot delete root directory"
+
             inode = self._resolve_path(path)
             if not inode:
                 return False, "Path not found"
@@ -160,12 +163,22 @@ class MetadataService:
 
             block_ids = list(inode.blocks) if inode.type == FileType.FILE else []
 
+            if inode.type == FileType.FILE:
+                for block_id in block_ids:
+                    if block_id in self._blocks:
+                        del self._blocks[block_id]
+
             del self._inodes[inode.id]
 
             return True, "Success"
 
     def rename(self, old_path: str, new_path: str) -> Tuple[bool, str]:
         with self._lock:
+            if old_path == "/" or old_path == "":
+                return False, "Cannot rename root directory"
+            if new_path == "/" or new_path == "":
+                return False, "Cannot rename to root directory"
+
             inode = self._resolve_path(old_path)
             if not inode:
                 return False, "Source path not found"
@@ -272,6 +285,50 @@ class MetadataService:
             inode.modified_at = time.time()
             inode.version += 1
             return True, "Success"
+
+    def allocate_temp_blocks(self, num_blocks: int) -> Tuple[bool, str, List[str]]:
+        with self._lock:
+            new_block_ids = []
+            for _ in range(num_blocks):
+                block_id = f"blk_{self._next_block_id}"
+                self._next_block_id += 1
+                block_info = BlockInfo(block_id=block_id)
+                self._blocks[block_id] = block_info
+                new_block_ids.append(block_id)
+            return True, "Success", new_block_ids
+
+    def commit_file_update(self, path: str, new_block_ids: List[str],
+                           new_size: int,
+                           block_replicas: Dict[str, List[str]]) -> Tuple[bool, str]:
+        with self._lock:
+            inode = self._resolve_path(path)
+            if not inode or inode.type != FileType.FILE:
+                return False, "Not a file"
+
+            old_block_ids = list(inode.blocks)
+
+            for bid, reps in block_replicas.items():
+                if bid in self._blocks:
+                    self._blocks[bid].replicas = reps
+                    self._blocks[bid].size = 0
+                    self._blocks[bid].version += 1
+
+            inode.blocks = new_block_ids
+            inode.size = new_size
+            inode.modified_at = time.time()
+            inode.version += 1
+
+            for block_id in old_block_ids:
+                if block_id in self._blocks:
+                    del self._blocks[block_id]
+
+            return True, "Success"
+
+    def rollback_temp_blocks(self, temp_block_ids: List[str]):
+        with self._lock:
+            for block_id in temp_block_ids:
+                if block_id in self._blocks:
+                    del self._blocks[block_id]
 
     def clear_file_blocks(self, path: str) -> Tuple[bool, str, List[str]]:
         with self._lock:

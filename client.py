@@ -116,8 +116,15 @@ class DFSClient:
     def delete(self, path: str) -> Tuple[bool, str]:
         success, msg, inode = self.metadata_service.get_metadata(path)
         block_ids = []
-        if success and inode and inode.type == FileType.FILE:
-            block_ids = list(inode.blocks)
+        deleted_inode_id = None
+        child_paths_to_invalidate = set()
+
+        if success and inode:
+            deleted_inode_id = inode.id
+            if inode.type == FileType.FILE:
+                block_ids = list(inode.blocks)
+            elif inode.type == FileType.DIRECTORY:
+                self._collect_child_paths(path, inode, child_paths_to_invalidate)
 
         success, msg = self.metadata_service.delete(path)
         if success:
@@ -129,18 +136,62 @@ class DFSClient:
             parent_path = path.rsplit("/", 1)[0] or "/"
             self._metadata_cache.invalidate_prefix(self._cache_key(parent_path, "list"))
             self._metadata_cache.invalidate(self._cache_key(path))
+            self._metadata_cache.invalidate(self._cache_key(path, "blocks"))
+            self._metadata_cache.invalidate(self._cache_key(path, "list"))
+
+            for child_path in child_paths_to_invalidate:
+                self._metadata_cache.invalidate(self._cache_key(child_path))
+                self._metadata_cache.invalidate(self._cache_key(child_path, "blocks"))
+                self._metadata_cache.invalidate(self._cache_key(child_path, "list"))
+
             self._metadata_cache.invalidate_prefix(self._cache_key(path + "/"))
+
         return success, msg
 
+    def _collect_child_paths(self, parent_path: str, dir_inode: INode, result: set):
+        for child_name, child_id in dir_inode.children.items():
+            success, _, child = self.metadata_service.get_metadata(
+                parent_path + "/" + child_name if parent_path != "/" else "/" + child_name
+            )
+            if success and child:
+                child_path = parent_path + "/" + child_name if parent_path != "/" else "/" + child_name
+                result.add(child_path)
+                if child.type == FileType.DIRECTORY:
+                    self._collect_child_paths(child_path, child, result)
+
     def rename(self, old_path: str, new_path: str) -> Tuple[bool, str]:
+        old_child_paths = set()
+        success_old, _, old_inode = self.metadata_service.get_metadata(old_path)
+        if success_old and old_inode and old_inode.type == FileType.DIRECTORY:
+            self._collect_child_paths(old_path, old_inode, old_child_paths)
+
         success, msg = self.metadata_service.rename(old_path, new_path)
         if success:
             old_parent = old_path.rsplit("/", 1)[0] or "/"
             new_parent = new_path.rsplit("/", 1)[0] or "/"
+
             self._metadata_cache.invalidate_prefix(self._cache_key(old_parent, "list"))
             self._metadata_cache.invalidate_prefix(self._cache_key(new_parent, "list"))
             self._metadata_cache.invalidate(self._cache_key(old_path))
+            self._metadata_cache.invalidate(self._cache_key(old_path, "blocks"))
+            self._metadata_cache.invalidate(self._cache_key(old_path, "list"))
             self._metadata_cache.invalidate(self._cache_key(new_path))
+            self._metadata_cache.invalidate(self._cache_key(new_path, "blocks"))
+            self._metadata_cache.invalidate(self._cache_key(new_path, "list"))
+
+            for old_child in old_child_paths:
+                rel = old_child[len(old_path):]
+                new_child = new_path + rel
+                self._metadata_cache.invalidate(self._cache_key(old_child))
+                self._metadata_cache.invalidate(self._cache_key(old_child, "blocks"))
+                self._metadata_cache.invalidate(self._cache_key(old_child, "list"))
+                self._metadata_cache.invalidate(self._cache_key(new_child))
+                self._metadata_cache.invalidate(self._cache_key(new_child, "blocks"))
+                self._metadata_cache.invalidate(self._cache_key(new_child, "list"))
+
+            self._metadata_cache.invalidate_prefix(self._cache_key(old_path + "/"))
+            self._metadata_cache.invalidate_prefix(self._cache_key(new_path + "/"))
+
         return success, msg
 
     def get_metadata(self, path: str, use_cache: bool = True) -> Tuple[bool, str, Optional[INode]]:
@@ -177,53 +228,105 @@ class DFSClient:
         success, msg, inode = self.metadata_service.get_metadata(path)
         file_existed = success and inode is not None
 
+        created = False
         if not file_existed:
             success, msg = self.create_file(path)
             if not success:
                 return False, msg
-
-        if file_existed and inode and inode.type == FileType.FILE and inode.blocks:
-            success, msg, old_block_ids = self.metadata_service.clear_file_blocks(path)
-            if success:
-                for block_id in old_block_ids:
-                    for node in self.storage_nodes.values():
-                        if node.has_block(block_id):
-                            node.delete_block(block_id)
+            created = True
 
         total_size = len(data)
-        num_blocks = (total_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+        num_blocks = (total_size + BLOCK_SIZE - 1) // BLOCK_SIZE if total_size > 0 else 0
 
-        success, msg, new_block_ids = self.metadata_service.allocate_blocks(path, num_blocks)
+        success, msg, temp_block_ids = self.metadata_service.allocate_temp_blocks(num_blocks)
         if not success:
+            if created:
+                self.metadata_service.delete(path)
             return False, msg
 
-        for i, block_id in enumerate(new_block_ids):
+        written_nodes_per_block: Dict[str, List[str]] = {}
+        all_success = True
+        error_msg = ""
+
+        for i, block_id in enumerate(temp_block_ids):
             start = i * BLOCK_SIZE
-            end = min(start + BLOCK_SIZE, total_size)
-            block_data = data[start:end]
+            end = min(start + BLOCK_SIZE, total_size) if total_size > 0 else 0
+            block_data = data[start:end] if total_size > 0 else b""
 
             try:
                 replica_nodes = self.placement_strategy.place_block(
                     block_id, len(block_data)
                 )
             except ValueError as e:
-                return False, str(e)
+                all_success = False
+                error_msg = str(e)
+                break
 
-            success, msg = self.replication_manager.create_initial_replicas(
+            successfully_written = self._write_block_to_all_replicas(
                 block_id, block_data, replica_nodes
             )
-            if not success:
-                return False, f"Failed to write block {block_id}: {msg}"
 
-        self.metadata_service.update_file_size(path, total_size)
+            if len(successfully_written) < REPLICA_COUNT:
+                all_success = False
+                error_msg = (f"Block {block_id} only has {len(successfully_written)}/"
+                             f"{REPLICA_COUNT} replicas written")
+                for nid in successfully_written:
+                    if nid in self.storage_nodes:
+                        self.storage_nodes[nid].delete_block(block_id)
+                break
+
+            written_nodes_per_block[block_id] = successfully_written
+
+        if not all_success:
+            for bid in temp_block_ids:
+                for nid in written_nodes_per_block.get(bid, []):
+                    if nid in self.storage_nodes:
+                        self.storage_nodes[nid].delete_block(bid)
+                self.metadata_service.rollback_temp_blocks([bid])
+            if created:
+                self.metadata_service.delete(path)
+            return False, error_msg
+
+        success, msg = self.metadata_service.commit_file_update(
+            path, temp_block_ids, total_size, written_nodes_per_block
+        )
+        if not success:
+            for bid in temp_block_ids:
+                for nid in written_nodes_per_block.get(bid, []):
+                    if nid in self.storage_nodes:
+                        self.storage_nodes[nid].delete_block(bid)
+            if created:
+                self.metadata_service.delete(path)
+            return False, msg
 
         self._metadata_cache.invalidate(self._cache_key(path))
         self._metadata_cache.invalidate(self._cache_key(path, "blocks"))
+        self._metadata_cache.invalidate(self._cache_key(path, "list"))
 
         return True, "Success"
 
+    def _write_block_to_all_replicas(self, block_id: str, data: bytes,
+                                     node_ids: List[str]) -> List[str]:
+        successful = []
+        for node_id in node_ids:
+            node = self.storage_nodes.get(node_id)
+            if not node or not node.is_alive:
+                continue
+            try:
+                ok, _, _ = node.write_block(block_id, data)
+                if ok:
+                    successful.append(node_id)
+            except Exception:
+                continue
+        return successful
+
     def read_file(self, path: str, offset: int = 0,
                   length: Optional[int] = None) -> Tuple[bool, str, bytes]:
+        if offset < 0:
+            return False, "Invalid argument: offset cannot be negative", b""
+        if length is not None and length < 0:
+            return False, "Invalid argument: length cannot be negative", b""
+
         success, msg, inode = self.get_metadata(path)
         if not success or not inode:
             return False, msg, b""
